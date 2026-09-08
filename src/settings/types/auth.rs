@@ -104,4 +104,7 @@ pub struct PluginPrefsConfig {
     /// the settings PUT; the frontend normalizes on read.
     #[serde(default)]
     pub open_modes: std::collections::HashMap<String, String>,
+    /// Per-plugin floating-window opacity (0.3–1.0). Absent key = fully opaque.
+    #[serde(default)]
+    pub float_opacity: std::collections::HashMap<String, f64>,
 }

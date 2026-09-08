@@ -218,6 +218,32 @@ describe('PluginsTab folder picker', () => {
     wrapper.unmount()
   })
 
+  it('reveals and persists a floating-window opacity slider when open mode is floating', async () => {
+    seedComponentPlugin('json-formatter', 'JSON Formatter')
+    const wrapper = await mountInstalled()
+    await wrapper.get('.plugin-settings-btn').trigger('click')
+
+    // Default open mode (tab): the opacity slider stays hidden.
+    expect(wrapper.find('.plugin-float-opacity-row').exists()).toBe(false)
+
+    const select = wrapper.get('.plugin-open-mode-select')
+    await select.setValue('floating')
+    const row = wrapper.get('.plugin-float-opacity-row')
+    const range = row.get('input[type="range"]')
+    expect((range.element as HTMLInputElement).value).toBe('1')
+
+    await range.setValue('0.6')
+    await range.trigger('change')
+    expect(settings.plugin_prefs?.float_opacity?.['json-formatter']).toBeCloseTo(0.6)
+    expect(row.text()).toContain('60%')
+
+    // Switching away from floating hides the slider but keeps the stored value.
+    await select.setValue('tab')
+    expect(wrapper.find('.plugin-float-opacity-row').exists()).toBe(false)
+    expect(settings.plugin_prefs?.float_opacity?.['json-formatter']).toBeCloseTo(0.6)
+    wrapper.unmount()
+  })
+
   it('reveals the toolbar/open-mode prefs below the actions via the 偏好 button for component plugins', async () => {
     seedComponentPlugin('json-formatter', 'JSON Formatter')
     const wrapper = await mountInstalled()

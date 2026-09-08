@@ -356,6 +356,20 @@
                 <option value="pane">{{ t('plugin.openMode.pane') }}</option>
               </select>
             </label>
+            <div v-if="openModeOf(p.id) === 'floating'" class="plugin-float-opacity-row">
+              <span class="plugin-float-opacity-label">{{ t('plugin.floatOpacity') }}</span>
+              <input
+                type="range"
+                min="0.3"
+                max="1"
+                step="0.05"
+                class="plugin-float-opacity-range"
+                :value="floatOpacityOf(p.id)"
+                @input="onFloatOpacityInput(p.id, ($event.target as HTMLInputElement).value)"
+                @change="onFloatOpacityCommit"
+              />
+              <span class="plugin-float-opacity-val">{{ floatOpacityPercent(p.id) }}%</span>
+            </div>
           </div>
         </div>
       </template>
@@ -547,6 +561,43 @@ function onOpenModeChange(pluginId: string, value: string): void {
     }),
     open_modes: { ...settings.plugin_prefs?.open_modes, [pluginId]: mode },
   }
+  void saveSettings()
+}
+
+const FLOAT_OPACITY_MIN = 0.3
+const FLOAT_OPACITY_MAX = 1
+
+function floatOpacityOf(pluginId: string): number {
+  const raw = settings.plugin_prefs?.float_opacity?.[pluginId]
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return FLOAT_OPACITY_MAX
+  return Math.min(FLOAT_OPACITY_MAX, Math.max(FLOAT_OPACITY_MIN, raw))
+}
+
+function floatOpacityPercent(pluginId: string): number {
+  return Math.round(floatOpacityOf(pluginId) * 100)
+}
+
+/** Apply live while dragging; the value is persisted on the range `change` event. */
+function onFloatOpacityInput(pluginId: string, raw: string): void {
+  const value = Number(raw)
+  if (!Number.isFinite(value)) return
+  const prefs = settings.plugin_prefs ?? {
+    hidden_toolbar: [],
+    hidden_overlays: [],
+    show_incompatible: false,
+    open_modes: {},
+    float_opacity: {},
+  }
+  settings.plugin_prefs = {
+    ...prefs,
+    float_opacity: {
+      ...(prefs.float_opacity ?? {}),
+      [pluginId]: Math.min(FLOAT_OPACITY_MAX, Math.max(FLOAT_OPACITY_MIN, value)),
+    },
+  }
+}
+
+function onFloatOpacityCommit(): void {
   void saveSettings()
 }
 
@@ -916,6 +967,27 @@ async function onRefresh() {
   border-radius: var(--radius);
   padding: 1px 2px;
   max-width: 110px;
+}
+.plugin-float-opacity-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.plugin-float-opacity-label {
+  font-size: 11px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+.plugin-float-opacity-range {
+  width: 110px;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.plugin-float-opacity-val {
+  min-width: 36px;
+  font-size: 11px;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
 }
 .plugin-badge.category {
   color: var(--fg-muted);

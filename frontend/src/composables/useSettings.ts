@@ -258,6 +258,8 @@ export interface PluginPrefsConfig {
   show_incompatible: boolean
   /** Per-plugin open mode for component plugins; absent key = 'tab'. */
   open_modes?: Record<string, 'tab' | 'floating' | 'pane'>
+  /** Per-plugin floating-window opacity (0.3–1); absent key = fully opaque. */
+  float_opacity?: Record<string, number>
 }
 
 export interface ActionKey {
@@ -514,6 +516,7 @@ export const settings = reactive<SettingsData>({
     hidden_overlays: [],
     show_incompatible: false,
     open_modes: {},
+    float_opacity: {},
   },
   background: { mode: 'solid', color: null, opacity: 1.0, has_image: false },
   text: {

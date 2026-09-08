@@ -5,6 +5,8 @@
     :class="{ 'is-dragging': dragging, 'is-resizing': resizing }"
     :style="winStyle"
     @pointerdown.capture="onWindowPointerDown"
+    @mouseenter="hovering = true"
+    @mouseleave="hovering = false"
   >
     <div
       class="float-titlebar"
@@ -47,6 +49,7 @@ import { useI18n } from '../../composables/useI18n'
 import { useWindowResize } from '../../composables/useWindowResize'
 import { usePluginFloatWindowsStore } from '../../stores/pluginFloatWindows'
 import { floatPaneId } from '../../utils/pluginPaneId'
+import { settings } from '../../composables/useSettings'
 import type { LoadedPlugin, PluginContext } from '../../composables/usePluginLoader'
 import PluginView from './PluginView.vue'
 
@@ -59,6 +62,16 @@ const props = defineProps<{
 const { t } = useI18n()
 const store = usePluginFloatWindowsStore()
 const focusActive = inject(FOCUS_ACTIVE_KEY, undefined)
+
+/** Hovered -> fully opaque so the controls stay usable at a low configured opacity. */
+const hovering = ref(false)
+
+const FLOAT_OPACITY_MIN = 0.3
+function configuredOpacity(): number {
+  const raw = settings.plugin_prefs?.float_opacity?.[props.plugin.id]
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return 1
+  return Math.min(1, Math.max(FLOAT_OPACITY_MIN, raw))
+}
 
 const winEl = ref<HTMLElement | null>(null)
 
@@ -151,6 +164,7 @@ const winStyle = computed(() => ({
   width: `${size.value.w}px`,
   height: `${size.value.h}px`,
   zIndex: store.zOf(props.plugin.id),
+  opacity: hovering.value ? 1 : configuredOpacity(),
 }))
 
 function onWindowPointerDown() {
@@ -186,6 +200,7 @@ onBeforeUnmount(() => {
   border-radius: var(--radius);
   box-shadow: var(--dialog-shadow);
   overflow: hidden;
+  transition: opacity 0.15s ease;
 }
 .float-titlebar {
   display: flex;

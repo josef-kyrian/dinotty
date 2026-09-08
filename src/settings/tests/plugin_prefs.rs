@@ -30,6 +30,7 @@ fn plugin_prefs_round_trips_open_modes() {
         hidden_overlays: vec![],
         show_incompatible: false,
         open_modes: std::collections::HashMap::from([("json-formatter".into(), "floating".into())]),
+        ..Default::default()
     };
     let json = serde_json::to_string(&prefs).unwrap();
     let back: PluginPrefsConfig = serde_json::from_str(&json).unwrap();
@@ -40,4 +41,24 @@ fn plugin_prefs_round_trips_open_modes() {
 fn plugin_prefs_without_open_modes_deserializes_to_empty() {
     let prefs: PluginPrefsConfig = serde_json::from_str(r#"{"hidden_toolbar":["p1"]}"#).unwrap();
     assert!(prefs.open_modes.is_empty());
+}
+
+#[test]
+fn plugin_prefs_round_trips_float_opacity() {
+    let prefs = PluginPrefsConfig {
+        hidden_toolbar: vec![],
+        hidden_overlays: vec![],
+        show_incompatible: false,
+        open_modes: std::collections::HashMap::new(),
+        float_opacity: std::collections::HashMap::from([("json-formatter".into(), 0.6)]),
+    };
+    let json = serde_json::to_string(&prefs).unwrap();
+    let back: PluginPrefsConfig = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.float_opacity.get("json-formatter").copied(), Some(0.6));
+}
+
+#[test]
+fn plugin_prefs_without_float_opacity_deserializes_to_empty() {
+    let prefs: PluginPrefsConfig = serde_json::from_str(r#"{"hidden_toolbar":["p1"]}"#).unwrap();
+    assert!(prefs.float_opacity.is_empty());
 }

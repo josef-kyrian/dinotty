@@ -974,6 +974,7 @@ export default {
   'plugin.openMode.floating': '浮层窗口',
   'plugin.openMode.pane': '窗格',
   'plugin.floatWindow.close': '关闭窗口',
+  'plugin.floatOpacity': '浮层透明度',
   'plugin.incompatible': '当前系统不支持',
   'plugin.showIncompatible': '显示不兼容插件',
   'overlay.close': '关闭浮层',

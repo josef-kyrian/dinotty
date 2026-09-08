@@ -1005,6 +1005,7 @@ export default {
   'plugin.openMode.floating': 'Floating window',
   'plugin.openMode.pane': 'Pane',
   'plugin.floatWindow.close': 'Close window',
+  'plugin.floatOpacity': 'Floating window opacity',
   'plugin.incompatible': 'Not supported on this system',
   'plugin.showIncompatible': 'Show incompatible',
   'overlay.close': 'Close overlay',
