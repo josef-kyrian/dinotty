@@ -213,6 +213,18 @@ async fn mcp_call(
     name: &str,
     arguments: Value,
 ) -> TestResult<Value> {
+    Ok(serde_json::from_str(&mcp_text(client, base, token, id, name, arguments).await?)?)
+}
+
+/// Preserve plain-text tool responses for terminal input and screen polling.
+async fn mcp_text(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    id: i64,
+    name: &str,
+    arguments: serde_json::Value,
+) -> TestResult<String> {
     let resp = client
         .post(format!("{base}/mcp/message"))
         .bearer_auth(token)
@@ -228,7 +240,7 @@ async fn mcp_call(
     }
     let text =
         body["result"]["content"][0]["text"].as_str().ok_or("missing result.content[0].text")?;
-    Ok(serde_json::from_str(text)?)
+    Ok(text.to_owned())
 }
 
 #[tokio::test]

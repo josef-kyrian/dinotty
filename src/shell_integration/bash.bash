@@ -21,9 +21,13 @@ _dinotty_precmd() {
         printf '\033]133;D;%d\033\\' "$exit_code"
     fi
     __dinotty_prompt_seen=1
-    # Retain the existing cross-pane history synchronization after saving status.
-    history -a
-    history -r
+    # Replace the in-memory list after saving; appending the full file duplicates history
+    # and makes bounded-history eviction expensive. Incremental -n can skip or duplicate
+    # another pane's entries depending on its order relative to our own -a.
+    if history -a && [[ -n ${HISTFILE-} && -r $HISTFILE ]]; then
+        history -c
+        history -r
+    fi
     printf '\033]133;A\033\\'
     printf '\033]0;%s@%s:%s\007' "$USER" "${HOSTNAME%%.*}" "${PWD/#$HOME/~}"
     return "$exit_code"

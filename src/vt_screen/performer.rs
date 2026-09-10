@@ -3,7 +3,6 @@ use super::data::{
     PrivateModes, ScreenBuffer, MAX_COMBINING,
 };
 use std::collections::VecDeque;
-use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
 
@@ -30,8 +29,10 @@ pub(crate) struct ScreenPerformer<'a> {
     pub using_alternate: bool,
     pub command_state: &'a mut CommandState,
     pub pending_command: &'a mut Option<PendingCommand>,
+    /// Outer interactive programs retain their own eventual command result.
+    pub suspended_commands: &'a mut Vec<PendingCommand>,
     pub command_results: &'a mut Vec<super::data::CompletedCommand>,
-    /// Persistent evidence of actual shell integration.
+    /// Completion-hook evidence for the current foreground shell context.
     pub shell_integration: &'a mut bool,
     pub sync_events: &'a mut Vec<super::data::SyncEvent>,
     pub osc_actions: &'a mut Vec<OscAction>,
@@ -104,6 +105,13 @@ impl Perform for ScreenPerformer<'_> {
     }
 
     fn execute(&mut self, byte: u8) {
+        for pending in self.suspended_commands.iter_mut() {
+            match byte {
+                b'\r' => pending.carriage_return(),
+                0x08 => pending.backspace(),
+                _ => {}
+            }
+        }
         if *self.command_state != CommandState::Idle {
             if let Some(pending) = self.pending_command.as_mut() {
                 match byte {
@@ -449,6 +457,9 @@ impl Perform for ScreenPerformer<'_> {
 impl ScreenPerformer<'_> {
     /// Capture parsed text only; CSI/OSC payload bytes never reach this path.
     fn capture_char(&mut self, c: char) {
+        for pending in self.suspended_commands.iter_mut() {
+            pending.capture_char(c);
+        }
         if *self.command_state != CommandState::Idle {
             if let Some(pending) = self.pending_command.as_mut() {
                 pending.capture_char(c);
@@ -464,25 +475,27 @@ impl ScreenPerformer<'_> {
         };
         match *cmd {
             b"A" | b"B" => {
+                if PendingCommand::suspend_manual(self.pending_command, self.suspended_commands) {
+                    *self.shell_integration = false;
+                }
                 // A/B alone do not promise completion hooks (e.g. PowerShell).
                 // Keep pending output until D, even for older hooks that emit A first.
                 *self.command_state = CommandState::Idle;
             }
             b"C" => {
                 *self.shell_integration = true;
+                PendingCommand::suspend_manual(self.pending_command, self.suspended_commands);
                 if self.pending_command.is_none() {
-                    *self.pending_command = Some(PendingCommand {
-                        start_time: Instant::now(),
-                        output_buf: Vec::new(),
-                        output_cursor: 0,
-                        waiter: None,
-                    });
-                } else if *self.command_state != CommandState::Executing {
-                    // Discard echoed input and startup/prompt text before execution.
-                    if let Some(pending) = self.pending_command.as_mut() {
+                    *self.pending_command = Some(PendingCommand::new(true));
+                }
+                if let Some(pending) = self.pending_command.as_mut() {
+                    if !pending.execution_started {
+                        // Discard echoed input without replacing the API's registered waiter.
                         pending.output_buf.clear();
                         pending.output_cursor = 0;
                     }
+                    pending.integration_expected = true;
+                    pending.execution_started = true;
                 }
                 *self.command_state = CommandState::Executing;
             }
@@ -493,10 +506,22 @@ impl ScreenPerformer<'_> {
                     .and_then(|s| std::str::from_utf8(s).ok())
                     .and_then(|s| s.parse::<i32>().ok())
                     .unwrap_or(-1);
-                if let Some(pending) = self.pending_command.take() {
+                let outer_completion = !self.suspended_commands.is_empty()
+                    && self
+                        .pending_command
+                        .as_ref()
+                        .is_none_or(|pending| !pending.execution_started);
+                let completed = if outer_completion {
+                    self.suspended_commands.pop()
+                } else {
+                    self.pending_command.take()
+                };
+                if let Some(pending) = completed {
                     self.command_results.push(pending.complete(exit_code, "shell_integration"));
                 }
-                *self.command_state = CommandState::Idle;
+                if !outer_completion || self.pending_command.is_none() {
+                    *self.command_state = CommandState::Idle;
+                }
             }
             _ => {}
         }

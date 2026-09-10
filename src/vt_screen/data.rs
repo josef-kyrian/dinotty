@@ -30,6 +30,10 @@ pub(crate) struct PendingCommand {
     pub output_buf: Vec<u8>,
     /// UTF-8 byte offset used for CR/backspace overprinting within the current line.
     pub output_cursor: usize,
+    /// Whether this command's shell is expected to emit an authoritative completion.
+    pub integration_expected: bool,
+    /// A C marker distinguishes this execution from a suspended outer shell's D.
+    pub execution_started: bool,
     /// Registered before input injection; retained after caller timeout.
     pub waiter: Option<tokio::sync::oneshot::Sender<CommandResult>>,
 }
@@ -43,6 +47,33 @@ pub(crate) struct CompletedCommand {
 }
 
 impl PendingCommand {
+    /// Initialize capture in the current shell context without claiming an API waiter.
+    pub fn new(integration_expected: bool) -> Self {
+        Self {
+            start_time: Instant::now(),
+            output_buf: Vec::new(),
+            output_cursor: 0,
+            integration_expected,
+            execution_started: false,
+            waiter: None,
+        }
+    }
+
+    /// Retain a manually launched outer command while a nested shell accepts input.
+    /// API-owned commands, including timed-out/cancelled callers, cannot be suspended.
+    pub fn suspend_manual(pending: &mut Option<Self>, suspended: &mut Vec<Self>) -> bool {
+        if pending
+            .as_ref()
+            .is_some_and(|command| command.waiter.is_none() && command.execution_started)
+        {
+            if let Some(command) = pending.take() {
+                suspended.push(command);
+            }
+            return true;
+        }
+        false
+    }
+
     /// Apply printable text to the captured line, retaining at most 1 MiB of UTF-8.
     pub fn capture_char(&mut self, c: char) {
         const OUTPUT_LIMIT: usize = 1024 * 1024;

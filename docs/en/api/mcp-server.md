@@ -155,7 +155,9 @@ Execution uses the pane's existing interactive PTY, preserving its cwd, environm
 
 `stdout` is bounded parsed terminal text (up to 1 MiB), with control sequences and the following prompt excluded when shell integration is active. A PTY combines stdout and stderr; these cannot be separated. Fallback may include echoed input, recognizes common prompt patterns only, and reports `exit_code: -1` because the real shell status is unknown.
 
-Local Bash 4.4+ integration loads after user startup files and preserves existing prompt/preexec hooks. Older Bash and shells without completion hooks use fallback; unrecognized prompts can still time out. Once C/D completion hooks have been observed, heuristic prompt matching cannot override them. Removing those hooks later can therefore leave the pane busy until completion is restored or the pane is closed.
+Local Bash 4.4+ integration loads after user startup files and preserves existing prompt/preexec hooks. History synchronization saves new entries and replaces the in-memory history instead of appending duplicate copies of the entire file. Older Bash and shells without completion hooks use fallback; unrecognized prompts can still time out.
+
+After you manually open an interactive SSH connection in a pane, a recognized remote prompt allows `terminal_execute` to use that same connection. The outer `ssh` command keeps its separate completion; remote commands use prompt fallback unless that shell emits OSC completion hooks. Returning to the local shell restores its hook-based completion. For commands started by `terminal_execute`, observed completion hooks remain authoritative: prompt-like output cannot release a running or timed-out command. Start an interactive SSH login manually or with `terminal_send`; starting it with `terminal_execute` reserves the pane until SSH exits.
 
 **Hints:** `readOnlyHint: false`, `destructiveHint: true`
 

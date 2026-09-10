@@ -1,5 +1,203 @@
 //! Real HTTP and stdio execution tests share the running server and its live PTYs.
 
+#[path = "ssh_fixture.rs"]
+mod ssh_fixture;
+
+/// Wait for an actually rendered prompt, excluding command echo and old scrollback.
+async fn wait_for_prompt(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    pane: &str,
+    prompt: &str,
+) -> super::TestResult {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let screen = super::mcp_text(
+            client,
+            base,
+            token,
+            30,
+            "terminal_read",
+            serde_json::json!({"pane_id":pane}),
+        )
+        .await?;
+        if screen.trim_end().ends_with(prompt) {
+            // Prompt fallback intentionally requires a short quiet period.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            return Ok(());
+        }
+        assert!(std::time::Instant::now() < deadline, "missing {prompt}: {screen}");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Exercise manual login, remote state, timeout ownership, and return to local hooks.
+async fn exercise_nested_shell(command: &str) -> super::TestResult {
+    let home = shell_home()?;
+    let suffix = super::unique_suffix();
+    let token = "mcp-manual-nested-shell";
+    let (_guard, base) =
+        super::spawn_server_with_environment(token, &suffix, Some(home.path()), Some("/bin/bash"))?;
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build()?;
+    super::wait_until_ready(&client, &base).await?;
+    let created =
+        super::mcp_call(&client, &base, token, 1, "tab_create", serde_json::json!({})).await?;
+    let pane = created["pane_id"].as_str().unwrap();
+    execute(&client, &base, token, pane, ":", 5000).await?;
+    super::mcp_text(
+        &client,
+        &base,
+        token,
+        31,
+        "terminal_send",
+        serde_json::json!({"pane_id":pane,"command":command}),
+    )
+    .await?;
+    wait_for_prompt(&client, &base, token, pane, "remote@fixture:~$").await?;
+    let result = execute(
+        &client,
+        &base,
+        token,
+        pane,
+        "cd /; export DINOTTY_REMOTE_VALUE=retained; printf 'REMOTE_OK\\n'",
+        5000,
+    )
+    .await?;
+    assert_eq!(result["method"], "prompt_detection", "{result}");
+    assert_eq!(result["exit_code"], -1, "{result}");
+    assert!(result["stdout"].as_str().unwrap().contains("REMOTE_OK\n"), "{result}");
+    let result = execute(
+        &client,
+        &base,
+        token,
+        pane,
+        "printf 'state=%s:%s\\n' \"$PWD\" \"$DINOTTY_REMOTE_VALUE\"",
+        5000,
+    )
+    .await?;
+    assert!(result["stdout"].as_str().unwrap().contains("state=/:retained\n"), "{result}");
+    let result =
+        execute(&client, &base, token, pane, "sleep 0.5; printf 'LATE_REMOTE\\n'", 50).await?;
+    assert_eq!(result["method"], "timeout", "{result}");
+    let error = execute(&client, &base, token, pane, "printf POISON", 5000).await.unwrap_err();
+    assert!(error.to_string().contains("busy"), "{error}");
+    wait_for_prompt(&client, &base, token, pane, "remote@fixture:~$").await?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match execute(&client, &base, token, pane, "printf 'NEXT_REMOTE\\n'", 5000).await {
+            Ok(result) => {
+                assert_eq!(result["method"], "prompt_detection", "{result}");
+                assert!(result["stdout"].as_str().unwrap().contains("NEXT_REMOTE\n"), "{result}");
+                assert!(!result["stdout"].as_str().unwrap().contains("LATE_REMOTE"), "{result}");
+                break;
+            }
+            Err(error) => {
+                assert!(error.to_string().contains("busy"), "{error}");
+                assert!(std::time::Instant::now() < deadline, "remote completion was lost");
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
+    }
+    // Sending exit manually mirrors the browser and leaves the outer SSH result unowned.
+    super::mcp_text(
+        &client,
+        &base,
+        token,
+        32,
+        "terminal_send",
+        serde_json::json!({"pane_id":pane,"command":"exit"}),
+    )
+    .await?;
+    wait_for_prompt(&client, &base, token, pane, "custom>").await?;
+    let result =
+        execute(&client, &base, token, pane, "printf 'LOCAL_OK\\n'; bash -c 'exit 7'", 5000)
+            .await?;
+    assert_eq!(result["method"], "shell_integration", "{result}");
+    assert_eq!(result["exit_code"], 7, "{result}");
+    assert_eq!(result["stdout"], "LOCAL_OK\n", "{result}");
+    Ok(())
+}
+
+/// Always cover the nested-shell boundary, including hosts without an SSH daemon.
+#[tokio::test]
+async fn manually_opened_nested_shell_accepts_execute() -> super::TestResult {
+    exercise_nested_shell("env PS1='remote@fixture:~$ ' /bin/bash --noprofile --norc -i").await
+}
+
+/// Opt-in real OpenSSH login uses the same public MCP path as the local shell fixture.
+#[tokio::test]
+async fn manually_opened_ssh_accepts_execute() -> super::TestResult {
+    let Some(ssh) = ssh_fixture::SshFixture::start()? else {
+        eprintln!("skipping loopback SSH fixture: set DINOTTY_TEST_SSHD");
+        return Ok(());
+    };
+    exercise_nested_shell(&ssh.command).await
+}
+
+/// Repeated prompts retain shared history without duplicating memory or disk entries.
+#[tokio::test]
+async fn prompt_history_sync_does_not_duplicate_entries() -> super::TestResult {
+    let home = shell_home()?;
+    let mut history = String::new();
+    for index in 0..2000 {
+        std::fmt::Write::write_fmt(&mut history, format_args!(": history_entry_{index}\n"))?;
+    }
+    std::fs::write(home.path().join(".bash_history"), history)?;
+    let rc = home.path().join(".bashrc");
+    let config = std::fs::read_to_string(&rc)?;
+    std::fs::write(&rc, format!("{config}\nHISTSIZE=100000\nHISTFILESIZE=200000\n"))?;
+    let suffix = super::unique_suffix();
+    let token = "mcp-history-regression";
+    let (_guard, base) =
+        super::spawn_server_with_environment(token, &suffix, Some(home.path()), Some("/bin/bash"))?;
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build()?;
+    super::wait_until_ready(&client, &base).await?;
+    let created =
+        super::mcp_call(&client, &base, token, 1, "tab_create", serde_json::json!({})).await?;
+    let pane = created["pane_id"].as_str().unwrap();
+    execute(&client, &base, token, pane, ":", 5000).await?;
+    for _ in 0..3 {
+        super::mcp_text(
+            &client,
+            &base,
+            token,
+            33,
+            "terminal_send",
+            serde_json::json!({"pane_id":pane,"command":""}),
+        )
+        .await?;
+        wait_for_prompt(&client, &base, token, pane, "custom>").await?;
+    }
+    let result = execute(
+        &client,
+        &base,
+        token,
+        pane,
+        "history | /bin/grep -Ec '^ *[0-9]+ +: history_entry_[0-9]+$'",
+        5000,
+    )
+    .await?;
+    assert_eq!(result["stdout"], "2000\n", "{result}");
+    let mut file =
+        std::fs::OpenOptions::new().append(true).open(home.path().join(".bash_history"))?;
+    std::io::Write::write_all(&mut file, b": history_entry_2000\n")?;
+    execute(&client, &base, token, pane, ":", 5000).await?;
+    let result = execute(
+        &client,
+        &base,
+        token,
+        pane,
+        "history | /bin/grep -Ec '^ *[0-9]+ +: history_entry_[0-9]+$'",
+        5000,
+    )
+    .await?;
+    assert_eq!(result["stdout"], "2001\n", "{result}");
+    let saved = std::fs::read_to_string(home.path().join(".bash_history"))?;
+    assert_eq!(saved.lines().filter(|line| line.starts_with(": history_entry_")).count(), 2001);
+    Ok(())
+}
+
 /// Exercise a custom prompt, `PROMPT_COMMAND` array, and an independent DEBUG trap.
 fn shell_home() -> super::TestResult<tempfile::TempDir> {
     let home = tempfile::tempdir()?;
@@ -37,6 +235,7 @@ async fn execute(
         }),
     )
     .await
+    .map_err(|error| format!("command {command:?}: {error}").into())
 }
 
 /// HTTP completion preserves live shell state, output boundaries, status, and duration.

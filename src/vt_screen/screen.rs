@@ -20,6 +20,8 @@ pub struct VirtualScreen {
     // OSC 133 command detection
     pub(crate) command_state: CommandState,
     pub(crate) pending_command: Option<PendingCommand>,
+    /// Manual outer commands (such as ssh) awaiting completion after a nested shell exits.
+    pub(crate) suspended_commands: Vec<PendingCommand>,
     pub(crate) command_results: Vec<super::data::CompletedCommand>,
     /// Only received OSC markers establish integration, never API tracking.
     pub(crate) shell_integration: bool,
@@ -46,6 +48,7 @@ impl VirtualScreen {
             saved_cursor: None,
             command_state: CommandState::Idle,
             pending_command: None,
+            suspended_commands: Vec::new(),
             command_results: Vec::new(),
             shell_integration: false,
             last_output_time: None,
@@ -89,8 +92,10 @@ impl VirtualScreen {
     #[must_use]
     pub fn should_check_prompt(&self) -> bool {
         self.last_output_time.is_some_and(|t| t.elapsed().as_millis() >= 100)
-            && !self.shell_integration
-            && self.pending_command.as_ref().is_some_and(|p| !p.output_buf.is_empty())
+            && !self.using_alternate
+            && self.pending_command.as_ref().is_some_and(|p| {
+                !p.output_buf.is_empty() && (p.waiter.is_none() || !p.integration_expected)
+            })
     }
 
     /// Attempt prompt detection on the current screen content.
@@ -129,6 +134,15 @@ impl VirtualScreen {
 
         for re in patterns {
             if re.is_match(line) {
+                if PendingCommand::suspend_manual(
+                    &mut self.pending_command,
+                    &mut self.suspended_commands,
+                ) {
+                    // A manual foreground command may now be hosting an unintegrated SSH shell.
+                    self.shell_integration = false;
+                    self.command_state = CommandState::Idle;
+                    return false;
+                }
                 if let Some(mut pending) = self.pending_command.take() {
                     // Remove the heuristic prompt line from the captured text.
                     if self.command_state != CommandState::Idle {
@@ -152,12 +166,7 @@ impl VirtualScreen {
     /// Sets up state for command output collection.
     pub fn begin_command_tracking(&mut self) {
         self.command_state = CommandState::CommandStart;
-        self.pending_command = Some(PendingCommand {
-            start_time: Instant::now(),
-            output_buf: Vec::new(),
-            output_cursor: 0,
-            waiter: None,
-        });
+        self.pending_command = Some(PendingCommand::new(self.shell_integration));
         self.last_output_time = None;
     }
 
@@ -168,6 +177,10 @@ impl VirtualScreen {
     pub fn begin_execution(
         &mut self,
     ) -> Result<tokio::sync::oneshot::Receiver<CommandResult>, String> {
+        // Also recognize a nested prompt when an API call arrives before the watchdog tick.
+        if self.pending_command.as_ref().is_some_and(|pending| pending.waiter.is_none()) {
+            self.detect_prompt();
+        }
         if self.pending_command.is_some() {
             return Err("Pane is busy: the previous command has not completed".to_string());
         }
@@ -182,6 +195,7 @@ impl VirtualScreen {
     /// Drop a waiter only when input was never delivered or the terminal has closed.
     pub(crate) fn abandon_execution(&mut self) {
         self.pending_command.take();
+        self.suspended_commands.clear();
         self.command_state = CommandState::Idle;
     }
 
@@ -215,6 +229,7 @@ impl VirtualScreen {
             using_alternate: self.using_alternate,
             command_state: &mut self.command_state,
             pending_command: &mut self.pending_command,
+            suspended_commands: &mut self.suspended_commands,
             command_results: &mut self.command_results,
             shell_integration: &mut self.shell_integration,
             sync_events: &mut self.sync_events,
@@ -239,6 +254,7 @@ impl VirtualScreen {
                         using_alternate: true,
                         command_state: &mut self.command_state,
                         pending_command: &mut self.pending_command,
+                        suspended_commands: &mut self.suspended_commands,
                         command_results: &mut self.command_results,
                         shell_integration: &mut self.shell_integration,
                         sync_events: &mut self.sync_events,
@@ -256,6 +272,7 @@ impl VirtualScreen {
                         using_alternate: false,
                         command_state: &mut self.command_state,
                         pending_command: &mut self.pending_command,
+                        suspended_commands: &mut self.suspended_commands,
                         command_results: &mut self.command_results,
                         shell_integration: &mut self.shell_integration,
                         sync_events: &mut self.sync_events,
