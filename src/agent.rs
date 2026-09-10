@@ -26,7 +26,6 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 
 /// Maximum concurrent run requests per token.
@@ -305,107 +304,38 @@ async fn execute_command(
     command: &str,
     timeout_ms: u64,
 ) -> Result<AgentRunResponse, (StatusCode, AgentError)> {
-    let session = state.manager.sessions.get(pane_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            AgentError {
-                code: "NOT_FOUND".into(),
-                message: "Pane not found".into(),
-                details: None,
+    let session =
+        state.manager.sessions.get(pane_id).map(|entry| entry.value().clone()).ok_or_else(
+            || {
+                (
+                    StatusCode::NOT_FOUND,
+                    AgentError {
+                        code: "NOT_FOUND".into(),
+                        message: "Pane not found".into(),
+                        details: None,
+                    },
+                )
             },
-        )
-    })?;
+        )?;
 
-    // Send command + newline
-    {
-        // Clear any pending command tracking and start fresh
-        session
-            .screen
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .begin_command_tracking();
-
-        let cmd = format!("{command}\n");
-        session.write_input_sync(cmd.as_bytes()).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                AgentError {
-                    code: "INTERNAL_ERROR".into(),
-                    message: format!("Failed to write to PTY: {e}"),
-                    details: None,
-                },
-            )
-        })?;
-    }
-
-    // Wait for command completion via OSC 133 or timeout
-    let start = Instant::now();
-    let timeout = std::time::Duration::from_millis(timeout_ms);
-    let poll_interval = std::time::Duration::from_millis(50);
-
-    loop {
-        tokio::time::sleep(poll_interval).await;
-
-        // Check for command results from OSC 133
-        let results = session
-            .screen
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .drain_command_results();
-        if let Some(result) = results.into_iter().next() {
-            let stdout = session
-                .screen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take_command_output();
-            return Ok(AgentRunResponse {
-                exit_code: result.exit_code,
-                stdout,
-                stderr: String::new(),
-                duration: result.duration_ms,
-                pane_id: pane_id.to_string(),
-                method: result.method,
-            });
-        }
-
-        // Check for prompt detection fallback (after 100ms silence)
-        {
-            let mut screen =
-                session.screen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if screen.should_check_prompt() {
-                if let Some(result) = screen.detect_prompt() {
-                    let stdout = screen.take_command_output();
-                    return Ok(AgentRunResponse {
-                        exit_code: result.exit_code,
-                        stdout,
-                        stderr: String::new(),
-                        duration: result.duration_ms,
-                        pane_id: pane_id.to_string(),
-                        method: result.method,
-                    });
-                }
+    let result = session.execute_command(command, timeout_ms).await.map_err(|error| {
+        let (status, code) = match &error {
+            crate::session::command::ExecuteError::Busy => (StatusCode::CONFLICT, "EXECUTION_BUSY"),
+            crate::session::command::ExecuteError::Closed => (StatusCode::GONE, "SESSION_CLOSED"),
+            crate::session::command::ExecuteError::Write(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
             }
-        }
-
-        // Check timeout
-        if start.elapsed() >= timeout {
-            // Force-finish command tracking
-            let (stdout, result) = session
-                .screen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .finish_command_tracking(-1);
-
-            return Ok(AgentRunResponse {
-                exit_code: -1,
-                stdout,
-                stderr: String::new(),
-                duration: result.duration_ms,
-                pane_id: pane_id.to_string(),
-                method: "timeout".into(),
-            });
-        }
-    }
+        };
+        (status, AgentError { code: code.into(), message: error.to_string(), details: None })
+    })?;
+    Ok(AgentRunResponse {
+        exit_code: result.exit_code,
+        stdout: result.stdout,
+        stderr: String::new(),
+        duration: result.duration_ms,
+        pane_id: pane_id.to_string(),
+        method: result.method,
+    })
 }
 
 // ── POST /api/sessions/:pane_id/send ──

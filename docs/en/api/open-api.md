@@ -278,7 +278,9 @@ Synchronously execute a command, waiting for completion or timeout. Relies on [S
 |-------|-------------|
 | `shell_integration` | Command completion detected via OSC 133 (most accurate) |
 | `prompt_detection` | Detected via prompt pattern matching (fallback) |
-| `timeout` | Command timed out |
+| `timeout` | The wait timed out; the command may still be running |
+
+Execution shares the same live-PTY command tracking as MCP `terminal_execute`. A second tracked execution in the same pane is rejected while the first is pending, including after timeout or caller cancellation. Separate panes remain independent. `stdout` contains bounded parsed terminal text with stdout/stderr combined by the PTY; heuristic fallback reports status `-1`.
 
 **Capability:** `terminal:write` (agent token path)
 

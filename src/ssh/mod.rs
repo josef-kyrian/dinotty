@@ -467,6 +467,7 @@ async fn ssh_reader_task(
                             let mut screen =
                                 session.screen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             screen.feed(&bytes);
+                            session.collect_command_results(&mut screen);
                             screen.drain_osc_actions()
                         };
                         // OSC 9/777/BEL notification dispatch - after the

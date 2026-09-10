@@ -10,17 +10,100 @@ pub enum CommandState {
 }
 
 /// Result of a detected command execution
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct CommandResult {
+    /// Shell status, or -1 when completion was inferred or timed out.
     pub exit_code: i32,
+    /// Elapsed time since tracking began in this PTY.
     pub duration_ms: u64,
-    pub method: String, // "shell_integration" or "prompt_detection"
+    /// Completion source exposed to MCP and agent clients.
+    pub method: String,
+    /// Parsed terminal text belonging to this command, excluding control sequences.
+    pub stdout: String,
 }
 
 /// Tracks a pending command for collecting output
 pub(crate) struct PendingCommand {
+    /// Monotonic start retained across shell execution markers.
     pub start_time: Instant,
+    /// UTF-8 text collected by the VTE performer.
     pub output_buf: Vec<u8>,
+    /// UTF-8 byte offset used for CR/backspace overprinting within the current line.
+    pub output_cursor: usize,
+    /// Registered before input injection; retained after caller timeout.
+    pub waiter: Option<tokio::sync::oneshot::Sender<CommandResult>>,
+}
+
+/// Atomic parser completion, delivered once by the session extraction path.
+pub(crate) struct CompletedCommand {
+    /// Public result also forwarded to the event bus.
+    pub result: CommandResult,
+    /// Original caller, never reassigned to a subsequent execution.
+    pub waiter: Option<tokio::sync::oneshot::Sender<CommandResult>>,
+}
+
+impl PendingCommand {
+    /// Apply printable text to the captured line, retaining at most 1 MiB of UTF-8.
+    pub fn capture_char(&mut self, c: char) {
+        const OUTPUT_LIMIT: usize = 1024 * 1024;
+        let mut bytes = [0; 4];
+        let encoded = c.encode_utf8(&mut bytes).as_bytes();
+        if c == '\n' {
+            self.output_buf.push(b'\n');
+            self.output_cursor = self.output_buf.len();
+        } else {
+            let mut end = self.output_cursor;
+            if end < self.output_buf.len() {
+                end += 1;
+                while end < self.output_buf.len() && self.output_buf[end] & 0xc0 == 0x80 {
+                    end += 1;
+                }
+            }
+            self.output_buf.splice(self.output_cursor..end, encoded.iter().copied());
+            self.output_cursor += encoded.len();
+        }
+        if self.output_buf.len() > OUTPUT_LIMIT {
+            let mut end = OUTPUT_LIMIT / 2;
+            while self.output_buf[end] & 0xc0 == 0x80 {
+                end += 1;
+            }
+            self.output_buf.drain(..end);
+            self.output_cursor = self.output_cursor.saturating_sub(end);
+        }
+    }
+
+    /// Model overprinting without exposing erased prompt padding (notably Zsh `PROMPT_SP`).
+    pub fn carriage_return(&mut self) {
+        self.output_cursor =
+            self.output_buf.iter().rposition(|b| *b == b'\n').map_or(0, |index| index + 1);
+        if self.output_buf[self.output_cursor..].iter().all(|b| *b == b' ') {
+            self.output_buf.truncate(self.output_cursor);
+        }
+    }
+
+    /// Keep backspace inside the current line and on a UTF-8 character boundary.
+    pub fn backspace(&mut self) {
+        if self.output_cursor == 0 || self.output_buf[self.output_cursor - 1] == b'\n' {
+            return;
+        }
+        self.output_cursor -= 1;
+        while self.output_cursor > 0 && self.output_buf[self.output_cursor] & 0xc0 == 0x80 {
+            self.output_cursor -= 1;
+        }
+    }
+
+    /// Transfer captured text and the registered waiter together on completion.
+    pub fn complete(self, exit_code: i32, method: &str) -> CompletedCommand {
+        CompletedCommand {
+            result: CommandResult {
+                exit_code,
+                duration_ms: self.start_time.elapsed().as_millis() as u64,
+                method: method.to_string(),
+                stdout: String::from_utf8_lossy(&self.output_buf).into_owned(),
+            },
+            waiter: self.waiter,
+        }
+    }
 }
 
 /// DEC mode 2026 synchronized output events

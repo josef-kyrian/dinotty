@@ -43,6 +43,16 @@ fn free_loopback_port() -> TestResult<u16> {
 }
 
 fn spawn_server(token: &str, suffix: &str) -> TestResult<(ServerGuard, String)> {
+    spawn_server_with_environment(token, suffix, None, None)
+}
+
+/// Isolate shell startup files for real PTY execution regressions.
+fn spawn_server_with_environment(
+    token: &str,
+    suffix: &str,
+    home: Option<&std::path::Path>,
+    shell: Option<&str>,
+) -> TestResult<(ServerGuard, String)> {
     let port = free_loopback_port()?;
     let server = env!("CARGO_BIN_EXE_dinotty-server");
 
@@ -59,6 +69,12 @@ fn spawn_server(token: &str, suffix: &str) -> TestResult<(ServerGuard, String)> 
         cmd.creation_flags(0x0800_0000 | 0x0000_0008);
     }
 
+    if let Some(home) = home {
+        cmd.env("HOME", home).env("XDG_CONFIG_HOME", home.join(".config"));
+    }
+    if let Some(shell) = shell {
+        cmd.env("SHELL", shell);
+    }
     let child = cmd.spawn()?;
     let base = format!("http://127.0.0.1:{port}");
     Ok((ServerGuard { child }, base))
@@ -107,6 +123,17 @@ fn run_stdio_proxy(
     suffix: &str,
     input_lines: &[&str],
 ) -> TestResult<(i32, Vec<String>, String)> {
+    run_stdio_proxy_with_home(port, token, suffix, input_lines, None)
+}
+
+/// Keep the proxy's configuration lookup in the same home as its server.
+fn run_stdio_proxy_with_home(
+    port: u16,
+    token: &str,
+    suffix: &str,
+    input_lines: &[&str],
+    home: Option<&std::path::Path>,
+) -> TestResult<(i32, Vec<String>, String)> {
     let server = env!("CARGO_BIN_EXE_dinotty-server");
 
     let mut cmd = Command::new(server);
@@ -123,6 +150,9 @@ fn run_stdio_proxy(
         cmd.creation_flags(0x0800_0000 | 0x0000_0008);
     }
 
+    if let Some(home) = home {
+        cmd.env("HOME", home).env("XDG_CONFIG_HOME", home.join(".config"));
+    }
     let mut child = cmd.spawn()?;
     {
         let mut stdin = child.stdin.take().expect("proxy stdin");
@@ -323,3 +353,7 @@ async fn mcp_endpoints_gate_when_disabled() -> TestResult {
     );
     Ok(())
 }
+
+#[cfg(unix)]
+#[path = "mcp_stdio/terminal_execute.rs"]
+mod terminal_execute;

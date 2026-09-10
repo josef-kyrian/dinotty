@@ -20,7 +20,9 @@ pub struct VirtualScreen {
     // OSC 133 command detection
     pub(crate) command_state: CommandState,
     pub(crate) pending_command: Option<PendingCommand>,
-    pub(crate) command_results: Vec<CommandResult>,
+    pub(crate) command_results: Vec<super::data::CompletedCommand>,
+    /// Only received OSC markers establish integration, never API tracking.
+    pub(crate) shell_integration: bool,
     // Prompt detection fallback
     pub(crate) last_output_time: Option<Instant>,
     // DEC mode 2026 synchronized output events
@@ -45,6 +47,7 @@ impl VirtualScreen {
             command_state: CommandState::Idle,
             pending_command: None,
             command_results: Vec::new(),
+            shell_integration: false,
             last_output_time: None,
             sync_events: Vec::new(),
             osc_actions: Vec::new(),
@@ -57,9 +60,17 @@ impl VirtualScreen {
         std::mem::take(&mut self.sync_events)
     }
 
-    /// Drain all pending command results. Called by the WS handler after feeding output.
+    /// Deliver each parser completion once and return copies for session notifications.
     pub fn drain_command_results(&mut self) -> Vec<CommandResult> {
         std::mem::take(&mut self.command_results)
+            .into_iter()
+            .map(|completed| {
+                if let Some(waiter) = completed.waiter {
+                    let _ = waiter.send(completed.result.clone());
+                }
+                completed.result
+            })
+            .collect()
     }
 
     /// Drain all pending OSC notification actions (OSC 9/777/BEL).
@@ -67,19 +78,10 @@ impl VirtualScreen {
         std::mem::take(&mut self.osc_actions)
     }
 
-    /// Get the collected stdout from the current/last command
-    pub fn take_command_output(&mut self) -> String {
-        self.pending_command
-            .as_mut()
-            .map(|p| String::from_utf8_lossy(&std::mem::take(&mut p.output_buf)).into_owned())
-            .unwrap_or_default()
-    }
-
-    /// Check if shell integration (OSC 133) has been detected
+    /// Check whether OSC 133 execution/completion hooks (C/D) have been detected.
     #[must_use]
     pub fn has_shell_integration(&self) -> bool {
-        !self.command_results.is_empty()
-            || matches!(self.command_state, CommandState::CommandStart | CommandState::Executing)
+        self.shell_integration
     }
 
     /// Check if enough time has passed since last output for prompt detection.
@@ -87,24 +89,27 @@ impl VirtualScreen {
     #[must_use]
     pub fn should_check_prompt(&self) -> bool {
         self.last_output_time.is_some_and(|t| t.elapsed().as_millis() >= 100)
-            && self.command_state == CommandState::Idle
+            && !self.shell_integration
+            && self.pending_command.as_ref().is_some_and(|p| !p.output_buf.is_empty())
     }
 
     /// Attempt prompt detection on the current screen content.
-    /// Returns a `CommandResult` if a prompt pattern is found at the cursor line.
-    pub fn detect_prompt(&mut self) -> Option<CommandResult> {
-        use regex::Regex;
-        use std::sync::OnceLock;
-
-        static PROMPT_PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
+    /// Queues a completion and returns true when a prompt pattern matches the cursor line.
+    pub fn detect_prompt(&mut self) -> bool {
+        static PROMPT_PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> = std::sync::OnceLock::new();
+        if !self.should_check_prompt() {
+            return false;
+        }
         let patterns = PROMPT_PATTERNS.get_or_init(|| {
             [
                 r"^[#$%>] ?$",
+                r"^PS .*> ?$",
+                r"^bash[-0-9.]*[$#] ?$",
                 r"^[a-zA-Z0-9_.\-]+@[a-zA-Z0-9_.\-]+[:~].*[$#] ?$",
                 r"^[a-zA-Z0-9_.\-]+@.*\$ ?$",
             ]
             .iter()
-            .filter_map(|p| Regex::new(p).ok())
+            .filter_map(|p| regex::Regex::new(p).ok())
             .collect()
         });
 
@@ -112,7 +117,7 @@ impl VirtualScreen {
         let buf = if self.using_alternate { &self.alternate } else { &self.primary };
         let row = buf.cursor.row;
         if row >= buf.rows {
-            return None;
+            return false;
         }
 
         let line: String = buf.cells[row]
@@ -124,66 +129,83 @@ impl VirtualScreen {
 
         for re in patterns {
             if re.is_match(line) {
-                let duration_ms = self
-                    .pending_command
-                    .as_ref()
-                    .map_or(0, |p| p.start_time.elapsed().as_millis() as u64);
-
+                if let Some(mut pending) = self.pending_command.take() {
+                    // Remove the heuristic prompt line from the captured text.
+                    if self.command_state != CommandState::Idle {
+                        if let Some(start) = pending.output_buf.iter().rposition(|b| *b == b'\n') {
+                            pending.output_buf.truncate(start + 1);
+                        } else {
+                            pending.output_buf.clear();
+                        }
+                    }
+                    self.command_results.push(pending.complete(-1, "prompt_detection"));
+                }
                 self.command_state = CommandState::Idle;
-                self.pending_command.take();
-
-                return Some(CommandResult {
-                    exit_code: -1,
-                    duration_ms,
-                    method: "prompt_detection".to_string(),
-                });
+                return true;
             }
         }
 
-        None
+        false
     }
 
     /// Called when a command is sent to the terminal (from agent API).
     /// Sets up state for command output collection.
     pub fn begin_command_tracking(&mut self) {
         self.command_state = CommandState::CommandStart;
-        self.pending_command =
-            Some(PendingCommand { start_time: Instant::now(), output_buf: Vec::new() });
+        self.pending_command = Some(PendingCommand {
+            start_time: Instant::now(),
+            output_buf: Vec::new(),
+            output_cursor: 0,
+            waiter: None,
+        });
+        self.last_output_time = None;
     }
 
-    /// Force-finish command tracking (e.g. on timeout). Returns collected output.
-    pub fn finish_command_tracking(&mut self, exit_code: i32) -> (String, CommandResult) {
-        let pending = self.pending_command.take();
-        let stdout = pending
-            .as_ref()
-            .map(|p| String::from_utf8_lossy(&p.output_buf).into_owned())
-            .unwrap_or_default();
-        let duration_ms = pending.map_or(0, |p| p.start_time.elapsed().as_millis() as u64);
+    /// Reserve the pane before writing, retaining ownership until actual completion.
+    ///
+    /// # Errors
+    /// Rejects another execution while an earlier command is still pending.
+    pub fn begin_execution(
+        &mut self,
+    ) -> Result<tokio::sync::oneshot::Receiver<CommandResult>, String> {
+        if self.pending_command.is_some() {
+            return Err("Pane is busy: the previous command has not completed".to_string());
+        }
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        self.begin_command_tracking();
+        if let Some(pending) = self.pending_command.as_mut() {
+            pending.waiter = Some(sender);
+        }
+        Ok(receiver)
+    }
 
-        let result = CommandResult { exit_code, duration_ms, method: "timeout".to_string() };
+    /// Drop a waiter only when input was never delivered or the terminal has closed.
+    pub(crate) fn abandon_execution(&mut self) {
+        self.pending_command.take();
         self.command_state = CommandState::Idle;
-        (stdout, result)
+    }
+
+    /// Snapshot a timeout without releasing a command that is still running.
+    #[must_use]
+    pub fn command_timeout(&self) -> CommandResult {
+        CommandResult {
+            exit_code: -1,
+            duration_ms: self
+                .pending_command
+                .as_ref()
+                .map_or(0, |p| p.start_time.elapsed().as_millis() as u64),
+            method: "timeout".to_string(),
+            stdout: self
+                .pending_command
+                .as_ref()
+                .map(|p| String::from_utf8_lossy(&p.output_buf).into_owned())
+                .unwrap_or_default(),
+        }
     }
 
     pub fn feed(&mut self, data: &[u8]) {
         // Track output timing for prompt detection fallback
         self.last_output_time = Some(Instant::now());
-
-        // Collect visible output for command stdout capture
-        if matches!(self.command_state, CommandState::CommandStart | CommandState::Executing) {
-            if let Some(ref mut pending) = self.pending_command {
-                // Only collect printable ASCII and UTF-8 text, skip ESC sequences
-                for &b in data {
-                    if b >= 0x20 && b != 0x7f {
-                        pending.output_buf.push(b);
-                    }
-                }
-                // Cap buffer at 1MB
-                if pending.output_buf.len() > 1024 * 1024 {
-                    pending.output_buf.drain(..512 * 1024);
-                }
-            }
-        }
 
         let mut performer = ScreenPerformer {
             screen: if self.using_alternate { &mut self.alternate } else { &mut self.primary },
@@ -194,6 +216,7 @@ impl VirtualScreen {
             command_state: &mut self.command_state,
             pending_command: &mut self.pending_command,
             command_results: &mut self.command_results,
+            shell_integration: &mut self.shell_integration,
             sync_events: &mut self.sync_events,
             osc_actions: &mut self.osc_actions,
             private_modes: &mut self.private_modes,
@@ -217,6 +240,7 @@ impl VirtualScreen {
                         command_state: &mut self.command_state,
                         pending_command: &mut self.pending_command,
                         command_results: &mut self.command_results,
+                        shell_integration: &mut self.shell_integration,
                         sync_events: &mut self.sync_events,
                         osc_actions: &mut self.osc_actions,
                         private_modes: &mut self.private_modes,
@@ -233,6 +257,7 @@ impl VirtualScreen {
                         command_state: &mut self.command_state,
                         pending_command: &mut self.pending_command,
                         command_results: &mut self.command_results,
+                        shell_integration: &mut self.shell_integration,
                         sync_events: &mut self.sync_events,
                         osc_actions: &mut self.osc_actions,
                         private_modes: &mut self.private_modes,

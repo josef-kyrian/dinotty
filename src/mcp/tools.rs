@@ -13,7 +13,6 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Instant;
 
 use crate::platform::process::CommandNoWindowExt;
 use crate::platform::shell_probe::ShellProbeService;
@@ -244,79 +243,10 @@ impl McpTools {
             return Err(format!("Token terminal:write scope does not include pane {pane_id}"));
         }
 
-        let session = self.manager.sessions.get(&pane_id).ok_or("Pane not found")?;
-
-        // Send command
-        {
-            session
-                .screen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .begin_command_tracking();
-            let cmd = format!("{command}\n");
-            session.write_input_sync(cmd.as_bytes()).map_err(|e| format!("Write failed: {e}"))?;
-        }
-
-        // Wait for completion
-        let start = Instant::now();
-        let timeout_dur = std::time::Duration::from_millis(timeout);
-
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-            let results = session
-                .screen
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .drain_command_results();
-            if let Some(result) = results.into_iter().next() {
-                let stdout = session
-                    .screen
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take_command_output();
-                return Ok(serde_json::json!({
-                    "exit_code": result.exit_code,
-                    "stdout": stdout,
-                    "duration_ms": result.duration_ms,
-                    "method": result.method
-                })
-                .to_string());
-            }
-
-            // Prompt detection fallback
-            {
-                let mut screen =
-                    session.screen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if screen.should_check_prompt() {
-                    if let Some(result) = screen.detect_prompt() {
-                        let stdout = screen.take_command_output();
-                        return Ok(serde_json::json!({
-                            "exit_code": result.exit_code,
-                            "stdout": stdout,
-                            "duration_ms": result.duration_ms,
-                            "method": result.method
-                        })
-                        .to_string());
-                    }
-                }
-            }
-
-            if start.elapsed() >= timeout_dur {
-                let (stdout, result) = session
-                    .screen
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .finish_command_tracking(-1);
-                return Ok(serde_json::json!({
-                    "exit_code": -1,
-                    "stdout": stdout,
-                    "duration_ms": result.duration_ms,
-                    "method": "timeout"
-                })
-                .to_string());
-            }
-        }
+        let session = self.manager.sessions.get(&pane_id).ok_or("Pane not found")?.value().clone();
+        let result =
+            session.execute_command(command, timeout).await.map_err(|error| error.to_string())?;
+        serde_json::to_string(&result).map_err(|error| error.to_string())
     }
 
     fn tool_terminal_read(&self, args: Value, token_info: &TokenInfo) -> Result<String, String> {
