@@ -1,8 +1,9 @@
 use super::data::{
-    Cell, CellAttrs, Color, CommandState, MouseEncoding, MouseProtocol, OscAction, PendingCommand,
-    PrivateModes, ScreenBuffer, MAX_COMBINING,
+    Cell, CellAttrs, Color, CommandResult, CommandState, MouseEncoding, MouseProtocol, OscAction,
+    PendingCommand, PrivateModes, ScreenBuffer, MAX_COMBINING,
 };
 use std::collections::VecDeque;
+use std::time::Instant;
 use unicode_width::UnicodeWidthChar;
 use vte::{Params, Perform};
 
@@ -29,11 +30,7 @@ pub(crate) struct ScreenPerformer<'a> {
     pub using_alternate: bool,
     pub command_state: &'a mut CommandState,
     pub pending_command: &'a mut Option<PendingCommand>,
-    /// Outer interactive programs retain their own eventual command result.
-    pub suspended_commands: &'a mut Vec<PendingCommand>,
-    pub command_results: &'a mut Vec<super::data::CompletedCommand>,
-    /// Completion-hook evidence for the current foreground shell context.
-    pub shell_integration: &'a mut bool,
+    pub command_results: &'a mut Vec<CommandResult>,
     pub sync_events: &'a mut Vec<super::data::SyncEvent>,
     pub osc_actions: &'a mut Vec<OscAction>,
     pub private_modes: &'a mut PrivateModes,
@@ -41,7 +38,6 @@ pub(crate) struct ScreenPerformer<'a> {
 
 impl Perform for ScreenPerformer<'_> {
     fn print(&mut self, c: char) {
-        self.capture_char(c);
         let width = UnicodeWidthChar::width(c).unwrap_or(0);
         if width == 0 {
             // Append combining character to the previous cell
@@ -105,25 +101,6 @@ impl Perform for ScreenPerformer<'_> {
     }
 
     fn execute(&mut self, byte: u8) {
-        for pending in self.suspended_commands.iter_mut() {
-            match byte {
-                b'\r' => pending.carriage_return(),
-                0x08 => pending.backspace(),
-                _ => {}
-            }
-        }
-        if *self.command_state != CommandState::Idle {
-            if let Some(pending) = self.pending_command.as_mut() {
-                match byte {
-                    b'\r' => pending.carriage_return(),
-                    0x08 => pending.backspace(),
-                    _ => {}
-                }
-            }
-        }
-        if matches!(byte, b'\n' | b'\t') {
-            self.capture_char(char::from(byte));
-        }
         match byte {
             0x08 // BS
                 if self.screen.cursor.col > 0 => {
@@ -455,73 +432,76 @@ impl Perform for ScreenPerformer<'_> {
 }
 
 impl ScreenPerformer<'_> {
-    /// Capture parsed text only; CSI/OSC payload bytes never reach this path.
-    fn capture_char(&mut self, c: char) {
-        for pending in self.suspended_commands.iter_mut() {
-            pending.capture_char(c);
-        }
-        if *self.command_state != CommandState::Idle {
-            if let Some(pending) = self.pending_command.as_mut() {
-                pending.capture_char(c);
-            }
-        }
-    }
-
-    /// OSC 133 A/B delimit the prompt; C starts execution and D completes it.
-    /// Legacy D-only integrations can still finish an explicitly tracked command.
+    /// OSC 133: Shell Integration (`VS Code` / `FinalTerm` / iTerm2)
+    /// Format: ESC ] 133 ; <cmd> [ ; <args> ] ST
+    ///   A = Prompt start
+    ///   B = Command start (after user presses Enter)
+    ///   C = Command executed (not all shells emit this)
+    ///   D = Command finished, followed by `;exit_code`
     fn dispatch_osc133(&mut self, params: &[&[u8]]) {
-        let Some(cmd) = params.get(1) else {
+        if params.len() < 2 {
             return;
-        };
-        match *cmd {
-            b"A" | b"B" => {
-                if PendingCommand::suspend_manual(self.pending_command, self.suspended_commands) {
-                    *self.shell_integration = false;
-                }
-                // A/B alone do not promise completion hooks (e.g. PowerShell).
-                // Keep pending output until D, even for older hooks that emit A first.
+        }
+        let cmd = params[1];
+        match cmd {
+            b"A" => {
+                // Prompt start
                 *self.command_state = CommandState::Idle;
+                self.pending_command.take();
             }
-            b"C" => {
-                *self.shell_integration = true;
-                PendingCommand::suspend_manual(self.pending_command, self.suspended_commands);
-                if self.pending_command.is_none() {
-                    *self.pending_command = Some(PendingCommand::new(true));
-                }
-                if let Some(pending) = self.pending_command.as_mut() {
-                    if !pending.execution_started {
-                        // Discard echoed input without replacing the API's registered waiter.
-                        pending.output_buf.clear();
-                        pending.output_cursor = 0;
+            b"B" => {
+                // Command start (user executed a command)
+                // If already tracking a command (double B without D), force-finish the old one
+                if matches!(
+                    *self.command_state,
+                    CommandState::CommandStart | CommandState::Executing
+                ) {
+                    if let Some(pending) = self.pending_command.take() {
+                        let duration_ms = pending.start_time.elapsed().as_millis() as u64;
+                        self.command_results.push(CommandResult {
+                            exit_code: -1,
+                            duration_ms,
+                            method: "interrupted".to_string(),
+                        });
                     }
-                    pending.integration_expected = true;
-                    pending.execution_started = true;
                 }
-                *self.command_state = CommandState::Executing;
+                *self.command_state = CommandState::CommandStart;
+                *self.pending_command =
+                    Some(PendingCommand { start_time: Instant::now(), output_buf: Vec::new() });
             }
             b"D" => {
-                *self.shell_integration = true;
-                let exit_code = params
-                    .get(2)
-                    .and_then(|s| std::str::from_utf8(s).ok())
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(-1);
-                let outer_completion = !self.suspended_commands.is_empty()
-                    && self
-                        .pending_command
-                        .as_ref()
-                        .is_none_or(|pending| !pending.execution_started);
-                let completed = if outer_completion {
-                    self.suspended_commands.pop()
+                // Command finished
+                let exit_code = if params.len() >= 3 {
+                    std::str::from_utf8(params[2])
+                        .ok()
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(-1)
                 } else {
-                    self.pending_command.take()
+                    -1
                 };
-                if let Some(pending) = completed {
-                    self.command_results.push(pending.complete(exit_code, "shell_integration"));
-                }
-                if !outer_completion || self.pending_command.is_none() {
-                    *self.command_state = CommandState::Idle;
-                }
+
+                let duration_ms = self
+                    .pending_command
+                    .as_ref()
+                    .map_or(0, |p| p.start_time.elapsed().as_millis() as u64);
+
+                let stdout = self
+                    .pending_command
+                    .as_mut()
+                    .map(|p| {
+                        String::from_utf8_lossy(&std::mem::take(&mut p.output_buf)).into_owned()
+                    })
+                    .unwrap_or_default();
+
+                self.command_results.push(CommandResult {
+                    exit_code,
+                    duration_ms,
+                    method: "shell_integration".to_string(),
+                });
+
+                *self.command_state = CommandState::Idle;
+                self.pending_command.take();
+                let _ = stdout; // available for future use
             }
             _ => {}
         }

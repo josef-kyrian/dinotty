@@ -1,5 +1,4 @@
 mod backend;
-pub mod command;
 mod cwd;
 mod layout;
 pub mod ledger;
@@ -46,6 +45,13 @@ pub struct SyncState {
     active: bool,
     buffer: Vec<String>,
     bytes: usize,
+}
+
+pub struct PendingCommandResult {
+    pub exit_code: i32,
+    pub duration_ms: u64,
+    pub stdout: String,
+    pub method: String,
 }
 
 #[derive(Clone, Debug)]
@@ -145,7 +151,7 @@ pub struct Session {
     /// Receiver side, taken once by the broadcast task.
     pub output_rx: Mutex<Option<mpsc::UnboundedReceiver<Vec<u8>>>>,
     /// Command results extracted during `feed()`, consumed by the broadcast task.
-    pub pending_results: Mutex<Vec<crate::vt_screen::CommandResult>>,
+    pub pending_results: Mutex<Vec<PendingCommandResult>>,
 }
 
 impl Session {
@@ -760,7 +766,6 @@ impl Session {
             *exited = true;
             newly_exited
         };
-        self.screen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).abandon_execution();
         let mut clients = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         clients.retain(|client| !client.tx.is_closed());
         for client in clients.iter() {

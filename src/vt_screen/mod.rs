@@ -5,8 +5,6 @@
     clippy::cast_possible_wrap,
     clippy::struct_excessive_bools
 )]
-#[cfg(test)]
-mod command_tests;
 mod data;
 mod performer;
 mod render;
@@ -333,7 +331,7 @@ mod csi_dispatch_tests {
         vs.feed(b"\r\nPOST_CAP_MARKER\r\n");
         assert!(vs.snapshot_plain().contains("POST_CAP_MARKER"));
 
-        let output = vs.command_timeout().stdout;
+        let output = vs.take_command_output();
         assert!(std::str::from_utf8(output.as_bytes()).is_ok());
         assert!(output.contains("你好"));
         assert!(output.contains("世界"));
@@ -653,7 +651,6 @@ mod osc_notification_tests {
         let mut vs = VirtualScreen::new(20, 5);
         vs.feed(b"\x1b]133;A\x07");
         vs.feed(b"\x1b]133;B\x07");
-        vs.feed(b"\x1b]133;C\x07");
         vs.feed(b"\x1b]133;D;0\x07");
         let results = vs.drain_command_results();
         assert_eq!(results.len(), 1);

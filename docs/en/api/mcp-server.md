@@ -147,17 +147,7 @@ Execute a shell command and wait for completion.
 
 `pane_id` is optional, defaulting to `active` (the currently active pane, or the first pane when none is active).
 
-**Returns:** JSON string containing `exit_code`, `stdout`, `duration_ms`, `method`.
-
-Execution uses the pane's existing interactive PTY, preserving its cwd, environment, and shell functions. Only one tracked command may run in a pane at a time; another execute request is rejected as busy. Different panes execute independently.
-
-`method` is `shell_integration` for OSC 133 completion, `prompt_detection` for heuristic fallback, or `timeout`. A timeout stops waiting, **not the running command**: the pane remains busy until that command actually finishes. Late completion is never reused for the next request. Cancellation of a waiting request follows the same rule.
-
-`stdout` is bounded parsed terminal text (up to 1 MiB), with control sequences and the following prompt excluded when shell integration is active. A PTY combines stdout and stderr; these cannot be separated. Fallback may include echoed input, recognizes common prompt patterns only, and reports `exit_code: -1` because the real shell status is unknown.
-
-Local Bash 4.4+ integration loads after user startup files and preserves existing prompt/preexec hooks. History synchronization saves new entries and replaces the in-memory history instead of appending duplicate copies of the entire file. Older Bash and shells without completion hooks use fallback; unrecognized prompts can still time out.
-
-After you manually open an interactive SSH connection in a pane, a recognized remote prompt allows `terminal_execute` to use that same connection. The outer `ssh` command keeps its separate completion; remote commands use prompt fallback unless that shell emits OSC completion hooks. Returning to the local shell restores its hook-based completion. For commands started by `terminal_execute`, observed completion hooks remain authoritative: prompt-like output cannot release a running or timed-out command. Start an interactive SSH login manually or with `terminal_send`; starting it with `terminal_execute` reserves the pane until SSH exits.
+**Returns:** JSON string containing `exit_code`, `stdout`, `duration_ms`, `method`
 
 **Hints:** `readOnlyHint: false`, `destructiveHint: true`
 

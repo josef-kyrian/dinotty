@@ -126,7 +126,7 @@ pub async fn broadcast_task(session: Arc<Session>, pane_id: String, manager: Arc
                     sync_started_at = None;
                 }
 
-                let results: Vec<crate::vt_screen::CommandResult> = {
+                let results: Vec<crate::session::PendingCommandResult> = {
                     let mut pending = session
                         .pending_results
                         .lock()
@@ -174,17 +174,6 @@ pub async fn broadcast_task(session: Arc<Session>, pane_id: String, manager: Arc
             _ = sync_watch.tick() => {
                 if session.is_exited() {
                     break;
-                }
-                // Fallback runs independently of an MCP caller, including after timeout.
-                let completed = {
-                    let mut screen = session.screen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let completed = screen.detect_prompt();
-                    session.collect_command_results(&mut screen);
-                    completed
-                };
-                if completed {
-                    // Wake the existing event/sync fanout even without fresh PTY bytes.
-                    let _ = session.output_tx.send(Vec::new());
                 }
                 // PTY-silent watchdog: if sync mode is still active past the
                 // timeout with no new output, force-flush so the client
@@ -263,7 +252,6 @@ pub fn create_session(
         }
     });
 
-    let mut bash_hooks = None;
     let (mut cmd, shell_type, shell_launch_kind, effective_cwd, host_cwd) = if let Some(argv) = argv
     {
         let effective_cwd = requested_host_cwd.clone().unwrap_or_else(|| home_path.clone());
@@ -295,21 +283,7 @@ pub fn create_session(
             }
         };
         let mut cmd = CommandBuilder::new(&shell_spec.program);
-        if shell_spec.shell_type == "bash" && shell_spec.launch_kind == ShellLaunchKind::Native {
-            let hooks =
-                setup_bash_hooks().map_err(|error| format!("Bash integration setup: {error}"))?;
-            cmd.arg("--rcfile");
-            cmd.arg(hooks.path().join("bashrc"));
-            if shell_spec.args.iter().any(|arg| matches!(arg.as_str(), "-l" | "--login")) {
-                cmd.env("DINOTTY_BASH_LOGIN", "1");
-            }
-            cmd.args(
-                shell_spec.args.iter().filter(|arg| !matches!(arg.as_str(), "-l" | "--login")),
-            );
-            bash_hooks = Some(hooks);
-        } else {
-            cmd.args(&shell_spec.args);
-        }
+        cmd.args(&shell_spec.args);
         (cmd, shell_spec.shell_type.clone(), shell_spec.launch_kind, effective_cwd, host_cwd)
     };
     for key in claude_session_env_keys_to_strip() {
@@ -339,10 +313,21 @@ pub fn create_session(
         if std::env::var_os("HOME").is_none() {
             cmd.env("HOME", &home);
         }
-        if shell_type == "zsh" {
-            if let Some(zdotdir) = setup_zsh_title_hooks(&home) {
-                cmd.env("ZDOTDIR", &zdotdir);
+        match shell_type.as_str() {
+            "zsh" => {
+                if let Some(zdotdir) = setup_zsh_title_hooks(&home) {
+                    cmd.env("ZDOTDIR", &zdotdir);
+                }
             }
+            "bash" => {
+                cmd.env(
+                    "PROMPT_COMMAND",
+                    r#"history -a; history -r; printf "\033]0;%s@%s:%s\007" "${USER}" "${HOSTNAME%%.*}" "${PWD/#$HOME/~}"; printf "\033]133;A\033\\"; printf "\033]133;D;%d\033\\" $?"#,
+                );
+                // Inject preexec-like trap for command start detection
+                cmd.env("BASH_ENV", r#"trap 'printf "\033]133;B\033\\"' DEBUG"#);
+            }
+            _ => {}
         }
     }
 
@@ -458,8 +443,6 @@ pub fn create_session(
     let reader_pane = pane_id.to_string();
     let reader_manager = Arc::clone(manager);
     tokio::task::spawn_blocking(move || {
-        // Keep the private rcfile alive until the shell has exited.
-        let _bash_hooks = bash_hooks;
         let mut reader = reader;
         let mut buf = vec![0u8; 65536]; // 64KB — fewer read() syscalls
         loop {
@@ -486,14 +469,16 @@ pub fn create_session(
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             screen.feed(data);
-                            reader_session.collect_command_results(&mut screen);
+                            let results = screen.drain_command_results();
+                            let outputs: Vec<String> =
+                                (0..results.len()).map(|_| screen.take_command_output()).collect();
                             let sync = screen.drain_sync_events();
                             let osc = screen.drain_osc_actions();
-                            (sync, osc)
+                            (results.into_iter().zip(outputs).collect::<Vec<_>>(), sync, osc)
                         }))
                     };
                     match feed_result {
-                        Ok((sync_events, osc_actions)) => {
+                        Ok((command_results, sync_events, osc_actions)) => {
                             // Apply sync transitions before publishing this read to output_tx.
                             // The broadcast task cannot observe these bytes until send() below.
                             for event in sync_events {
@@ -504,6 +489,21 @@ pub fn create_session(
                                     crate::vt_screen::SyncEvent::Stop => {
                                         reader_session.set_sync_mode(false);
                                     }
+                                }
+                            }
+                            // Queue command results for broadcast task
+                            if !command_results.is_empty() {
+                                let mut pending = reader_session
+                                    .pending_results
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                for (result, stdout) in command_results {
+                                    pending.push(crate::session::PendingCommandResult {
+                                        exit_code: result.exit_code,
+                                        duration_ms: result.duration_ms,
+                                        stdout,
+                                        method: result.method,
+                                    });
                                 }
                             }
                             // OSC 9/777/BEL notification dispatch - after the
@@ -621,13 +621,6 @@ fn append_wsl_cwd_args(args: &mut Vec<String>, host_cwd: Option<&std::path::Path
     args.push(host_cwd.map_or_else(|| "~".to_string(), |path| path.to_string_lossy().into_owned()));
 }
 
-/// Create a private rcfile; its owner must outlive shell startup.
-fn setup_bash_hooks() -> std::io::Result<tempfile::TempDir> {
-    let directory = tempfile::Builder::new().prefix("dinotty-bash-").tempdir()?;
-    std::fs::write(directory.path().join("bashrc"), include_str!("shell_integration/bash.bash"))?;
-    Ok(directory)
-}
-
 #[must_use]
 pub fn setup_zsh_title_hooks(home: &str) -> Option<std::path::PathBuf> {
     let zdotdir = std::env::temp_dir().join(format!("dinotty_zsh_{}", std::process::id()));
@@ -658,23 +651,18 @@ fi
 setopt INC_APPEND_HISTORY SHARE_HISTORY
 
 function _dinotty_precmd {{
-  local exit_code=$?
-  if [[ ${{_dinotty_running:-0}} == 1 ]]; then
-    printf "\033]133;D;%d\033\\" "$exit_code"
-  fi
-  _dinotty_running=0
-  printf "\033]133;A\033\\"
   printf "\033]0;%s@%s:%s\007" "${{USER}}" "${{HOST%%.*}}" "${{PWD/#$HOME/~}}"
+  printf "\033]133;A\033\\"
+  printf "\033]133;D;%d\033\\" $?
 }}
 
 function _dinotty_preexec {{
-  _dinotty_running=1
   printf "\033]0;%s\007" "$1"
-  printf "\033]133;C\033\\"
+  printf "\033]133;B\033\\"
 }}
 
 if [[ -z "${{precmd_functions[(r)_dinotty_precmd]}}" ]]; then
-  precmd_functions=(_dinotty_precmd ${{precmd_functions[@]}})
+  precmd_functions+=(_dinotty_precmd)
 fi
 if [[ -z "${{preexec_functions[(r)_dinotty_preexec]}}" ]]; then
   preexec_functions+=(_dinotty_preexec)
